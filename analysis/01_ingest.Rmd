@@ -1,0 +1,61 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+---
+title: "Phase 1 — DuckDB Ingestion"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+library(DBI)
+library(duckdb)
+library(here)
+```
+
+## Keep BD in memory only
+
+```{r connect}
+con <- dbConnect(duckdb(), dbdir = ":memory:")
+```
+
+### Create duckbd object
+
+```{r load_table}
+dbExecute(con,
+  paste0(
+    "CREATE TABLE framingham AS
+     SELECT * FROM read_csv_auto('",
+    here("data/raw/framingham.csv"),
+    "')"
+  )
+)
+```
+
+### Check data has been logged correctly
+
+```{r}
+dbGetQuery(con, "PRAGMA table_info('framingham')")
+```
+
+### Query data
+
+```{r}
+dbGetQuery(con, "SELECT * FROM framingham LIMIT 5")
+
+dbGetQuery(con, "SELECT PERIOD, COUNT(*) FROM framingham GROUP BY PERIOD ORDER BY PERIOD")
+```
+### More query
+
+```{r}
+dbGetQuery(con, "SELECT PERIOD, COUNT(*) AS n, AVG(TRY_CAST(AGE AS DOUBLE)) AS mean_age, AVG(TRY_CAST(TOTCHOL AS DOUBLE)) AS mean_chol FROM framingham GROUP BY PERIOD ORDER BY PERIOD")
+```
+
+## disconnect bd from memory
+
+```{r}
+dbDisconnect(con, shutdown = TRUE)
+```
+
