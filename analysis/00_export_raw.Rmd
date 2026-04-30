@@ -1,0 +1,16 @@
+---
+title: "00_export_raw"
+output: html_document
+date: "2026-04-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(riskCommunicator)
+library(here)
+data("framingham")
+write.csv(framingham, here::here("data/raw/framingham.csv"), row.names = FALSE)
+```
