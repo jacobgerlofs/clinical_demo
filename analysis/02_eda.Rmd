@@ -1,0 +1,87 @@
+---
+title: "Phase 2 — Data Wrangling & EDA"
+output: html_document
+---
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(here)
+library(ggplot2)
+```
+
+```{r load_data}
+framingham <- read_csv(here("data/raw/framingham.csv"))
+```
+
+## 1. Data structure
+
+```{r structure}
+# Inspect dimensions and column types
+glimpse(framingham) 
+```
+
+## 2. Missingness profile
+
+```{r missingness}
+# Summarise NA counts and proportions per variable
+framingham %>% 
+  dplyr::summarise(across(everything(), list(na_count = ~sum(is.na(.)), na_pct = ~mean(is.na(.)) * 100))) %>% 
+  pivot_longer(
+  cols = everything(),
+  names_to = c("variable", ".value"),
+  names_pattern = "^(.+)_(na_count|na_pct)$") %>% 
+  filter(na_count > 0) %>% 
+  arrange(desc(na_pct))
+```
+
+## 3. Key variable distributions
+
+```{r distributions}
+# Visualise distributions of key clinical variables
+
+create_plots <- function(col_name){
+
+dist_plot <- framingham %>% 
+  filter(!is.na(.data[[col_name]])) %>% 
+  ggplot(aes(x = .data[[col_name]])) +
+  geom_histogram(binwidth = 1) +
+  facet_grid(~PERIOD)
+
+return(dist_plot)
+}
+
+col_list <- c("AGE", "SYSBP", "DIABP", "BMI", "TOTCHOL", "HEARTRTE", "GLUCOSE")
+
+plot_list <- map(col_list, create_plots)
+
+for(item in plot_list) {
+  print(item)
+}
+```
+
+## 4. Longitudinal structure check
+
+```{r longitudinal}
+# Confirm RANDID and PERIOD structure — how many patients, how many have all 3 periods?
+patients <- framingham %>% 
+  group_by(PERIOD) %>% 
+  summarise(n_patients = n_distinct(RANDID)) %>% 
+  mutate(attrition_pct = round((1 - n_patients / first(n_patients)) * 100, 1))
+
+patients
+```
+
+## 5. Outcome variable summary
+
+```{r outcomes}
+# Summarise the key outcome variables (CVD, DEATH, ANYCHD, etc.)
+outcomes <- framingham %>% 
+  summarise(across(c(CVD, ANYCHD, DEATH, STROKE, HYPERTEN), list(count = ~sum(. == 1, na.rm = TRUE), pct = ~mean(., na.rm = TRUE)))) %>% 
+  pivot_longer(
+  cols = everything(),
+  names_to = c("variable", ".value"),
+  names_pattern = "^(.+)_(count|pct)$") %>% 
+  arrange(desc(pct))
+
+outcomes
+```
