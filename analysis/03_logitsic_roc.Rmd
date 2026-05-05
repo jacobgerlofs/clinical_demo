@@ -1,0 +1,143 @@
+---
+title: "03_logistic_roc"
+output: html_document
+date: "2026-05-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(here)
+library(DT)
+library(broom)       # tidy model output
+library(pROC)        # ROC curves and AUC
+library(probably)    # calibration plots (tidymodels-adjacent, well-maintained)
+```
+
+## 1. Data prep — build the analytic sample
+
+```{r load_data}
+framingham <- read_csv(here("data/raw/framingham.csv"))
+```
+
+```{r prep}
+# Filter to baseline exam only (PERIOD == 1) so each patient contributes
+# one row. CVD is the 10-year binary outcome; predictors are baseline values.
+analytic <- framingham %>%
+  filter(PERIOD == 1) %>%
+  select(
+    RANDID,
+    # Outcome
+    CVD,
+    # Predictors
+    AGE, SYSBP, TOTCHOL, BMI, GLUCOSE,
+    CURSMOKE, DIABETES
+  ) %>%
+  # Drop rows with any missing value (complete-case analysis)
+  drop_na()
+
+datatable(head(analytic, 20), caption = "Analytic sample — first 20 rows")
+```
+
+```{r sample_summary}
+# Quick sanity check: how many patients, what's the CVD event rate?
+analytic %>%
+  summarise(
+    n          = n(),
+    n_cvd      = sum(CVD),
+    cvd_rate   = round(mean(CVD), 3)
+  )
+```
+```{r}
+# Check what PREV* columns exist and their relationship to CVD
+framingham %>%
+  filter(PERIOD == 1) %>%
+  select(starts_with("PREV"), CVD) %>%
+  names()
+
+framingham %>%
+  filter(PERIOD == 1) %>%
+  count(PREVCHD, CVD)   # swap PREVCHD for whatever PREV* column shows up
+```
+
+```{r}
+# filtering cases where there was disease at baseline, re-checking rates
+analytic <- framingham %>%
+  filter(PERIOD == 1, PREVCHD == 0) %>%
+  select(
+    RANDID,
+    CVD,
+    AGE, SYSBP, TOTCHOL, BMI, GLUCOSE,
+    CURSMOKE, DIABETES
+  ) %>%
+  drop_na()
+
+analytic %>%
+  summarise(
+    n          = n(),
+    n_cvd      = sum(CVD),
+    cvd_rate   = round(mean(CVD), 3)
+  )
+```
+
+## 2 - logistic regression predicting CVD
+
+```{r}
+cvd_model <- glm(CVD ~ AGE + SYSBP + TOTCHOL + BMI + GLUCOSE + CURSMOKE + DIABETES, family = binomial, data = analytic)
+
+summary(cvd_model)
+
+tidy(cvd_model, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(where(is.numeric), ~round(., 3)))
+```
+
+### Examine calibration
+
+```{r}
+analytic %>%
+  mutate(
+    predicted = predict(cvd_model, type = "response"),
+    decile = ntile(predicted, 10)
+  ) %>%
+  group_by(decile) %>%
+  summarise(
+    mean_predicted = mean(predicted),
+    mean_observed  = mean(CVD),
+    n              = n()
+  ) %>%
+  ggplot(aes(x = mean_predicted, y = mean_observed)) +
+  geom_point(size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_smooth(method = "loess", se = FALSE, colour = "steelblue") +
+  labs(
+    x     = "Mean predicted probability",
+    y     = "Observed event rate",
+    title = "Calibration plot — CVD logistic model"
+  ) +
+  theme_minimal()
+```
+
+### ROC and AUC
+
+```{r}
+roc_obj <- roc(analytic$CVD, predict(cvd_model, type = "response"))
+
+ggroc(roc_obj, colour = "steelblue", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 1, linetype = "dashed", colour = "grey50") +
+  annotate("text", x = 0.3, y = 0.2,
+           label = paste0("AUC = ", round(auc(roc_obj), 3))) +
+  labs(
+    title = "ROC curve — CVD logistic model",
+    x     = "Specificity",
+    y     = "Sensitivity"
+  ) +
+  theme_minimal()
+```
+
+
+
+
