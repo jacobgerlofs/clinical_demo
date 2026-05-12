@@ -1,0 +1,402 @@
+---
+title: "04_risk_score"
+output: html_document
+date: "2026-05-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+# If rms or dcurves are not yet in your renv, install them first:
+#   renv::install("rms"); renv::install("dcurves"); renv::snapshot()
+
+library(tidyverse)
+library(here)
+library(DT)
+library(rms)       # Harrell's regression modelling strategies: lrm, validate, calibrate
+library(dcurves)   # decision curve analysis
+library(broom)     # tidy() for clean coefficient tables
+```
+
+
+## 1. Analytic sample
+
+Reproduce the Phase 3 analytic dataset so this script is fully self-contained.
+Criteria: baseline exam (PERIOD == 1), no prevalent CHD at baseline (PREVCHD == 0),
+complete cases on all seven predictors.
+
+```{r load_data, message=FALSE}
+framingham <- read_csv(here("data/raw/framingham.csv"))
+```
+
+```{r prep}
+analytic <- framingham %>%
+  filter(PERIOD == 1, PREVCHD == 0) %>%
+  select(RANDID, CVD, AGE, SYSBP, TOTCHOL, BMI, GLUCOSE, CURSMOKE, DIABETES) %>%
+  drop_na()
+
+analytic %>%
+  summarise(n = n(), n_cvd = sum(CVD), cvd_rate = round(mean(CVD), 3))
+```
+
+
+## 2. Fit the logistic model (two objects, same formula)
+
+We need two fit objects:
+
+- `cvd_glm` (base R `glm`) — used for coefficient extraction and point-score derivation.
+  Familiar from Phase 3; coefficients are raw log-odds.
+- `cvd_lrm` (rms `lrm`) — the same model fit through the rms framework. The rms object
+  stores the design matrix and outcome vector internally, which is what enables the
+  bootstrap routines `validate()` and `calibrate()` later.
+
+Both produce identical predicted probabilities; the difference is purely infrastructure.
+
+```{r glm_fit}
+cvd_glm <- glm(
+  CVD ~ AGE + SYSBP + TOTCHOL + BMI + GLUCOSE + CURSMOKE + DIABETES,
+  family = binomial,
+  data   = analytic
+)
+
+tidy(cvd_glm, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  datatable(caption = "Phase 3 model — odds ratios (recap)")
+```
+
+```{r lrm_fit}
+# rms requires a datadist object: a summary of each predictor's distribution.
+# lrm() uses this to compute reference-cell predictions and "typical patient" summaries.
+dd <- datadist(analytic)
+options(datadist = "dd")
+
+cvd_lrm <- lrm(
+  CVD ~ AGE + SYSBP + TOTCHOL + BMI + GLUCOSE + CURSMOKE + DIABETES,
+  data = analytic,
+  x    = TRUE,   # store design matrix — required for validate() / calibrate()
+  y    = TRUE    # store outcome vector — same reason
+)
+
+cvd_lrm
+```
+
+The `lrm` output reports Dxy (Somers' D concordance index) and C (the AUC). These should
+match the pROC AUC from Phase 3 to within rounding — a good sanity check.
+
+
+## 3. Convert to a point-based risk score
+
+### Why bother with a point score?
+
+A logistic regression model produces an individualized predicted probability, but it
+requires a computer to evaluate. In clinical settings — especially resource-limited ones,
+or for quick triage — a simple integer score that a clinician can compute on paper has
+real utility. This is how the original Framingham Risk Score (Wilson et al., 1998) and
+the CHADS₂ stroke-risk score work.
+
+The key insight is that a logistic model's **linear predictor** (LP = β₀ + Σ βⱼ xⱼ) is
+a weighted sum of the predictors. A point score is just a scaled, rounded version of that
+same sum — it preserves the ordering of predicted risk almost perfectly.
+
+### Sullivan scoring method (Sullivan et al., 2004)
+
+For each predictor j, assign integer points as:
+
+    points_j = round( βⱼ × incrementⱼ / β_ref )
+
+where:
+- βⱼ  is the regression coefficient (log-odds scale)
+- incrementⱼ  is a clinically meaningful step size (e.g. 10 mmHg of SBP)
+- β_ref  is a common scaling denominator — we use β_AGE (per 1 year of age)
+
+Dividing by β_ref anchors the scale: 1 point of score = the same risk increase as
+1 additional year of age. Everything else is expressed relative to that anchor.
+
+```{r point_score_derivation}
+coefs    <- coef(cvd_glm)
+beta_ref <- coefs["AGE"]   # anchor: 1 year of age
+
+# Clinically meaningful increments — chosen to produce legible integers
+increments <- c(
+  AGE      = 1,    # 1 year
+  SYSBP    = 10,   # 10 mmHg
+  TOTCHOL  = 40,   # 40 mg/dL (~1 mmol/L conversion step)
+  BMI      = 5,    # 5 kg/m²
+  GLUCOSE  = 20,   # 20 mg/dL
+  CURSMOKE = 1,    # binary: 1 = smoker
+  DIABETES = 1     # binary: 1 = diabetic
+)
+
+score_table <- tibble(
+  predictor  = names(increments),
+  beta       = coefs[names(increments)],
+  increment  = increments,
+  points_raw = beta * increment / beta_ref,
+  points     = round(points_raw)
+)
+
+score_table %>%
+  mutate(across(where(is.numeric), ~round(., 2))) %>%
+  datatable(caption = "Point score derivation — Sullivan method (β_ref = β_AGE)")
+```
+
+Read the `points` column as: *+1 point for each additional year of age; +N points for
+each increment of the continuous predictors; smokers and diabetics receive a fixed bonus.*
+
+### Apply score to the analytic sample
+
+Instead of rounding each predictor's contribution individually (which accumulates rounding
+error), we compute the exact scaled linear predictor and round the total once at the end.
+This is mathematically equivalent to summing the per-predictor points but more precise.
+
+```{r apply_score}
+intercept <- coefs["(Intercept)"]
+
+analytic_scored <- analytic %>%
+  mutate(
+    # Scaled LP: same as the logistic LP but divided by β_ref so the unit is "age-years"
+    lp_scaled  = (
+      AGE      * coefs["AGE"]      +
+      SYSBP    * coefs["SYSBP"]    +
+      TOTCHOL  * coefs["TOTCHOL"]  +
+      BMI      * coefs["BMI"]      +
+      GLUCOSE  * coefs["GLUCOSE"]  +
+      CURSMOKE * coefs["CURSMOKE"] +
+      DIABETES * coefs["DIABETES"]
+    ) / beta_ref,
+    risk_score = round(lp_scaled)
+  )
+
+# Distribution of scores by CVD status
+analytic_scored %>%
+  ggplot(aes(x = risk_score, fill = factor(CVD))) +
+  geom_histogram(binwidth = 2, position = "identity", alpha = 0.6, colour = "white") +
+  scale_fill_manual(
+    values = c("0" = "steelblue", "1" = "tomato"),
+    labels = c("0" = "No CVD",    "1" = "CVD"),
+    name   = "Outcome"
+  ) +
+  labs(
+    x     = "Risk score (integer points)",
+    y     = "Count",
+    title = "Distribution of integer risk scores by CVD status"
+  ) +
+  theme_minimal()
+```
+
+### Score-to-probability lookup table
+
+The relationship between the integer score and predicted probability follows directly from
+logistic regression:
+
+    P(CVD) = 1 / ( 1 + exp( –(β₀ + score × β_ref) ) )
+
+This is the lookup table you would print on a pocket card or clinical decision-support tool.
+
+```{r score_to_prob}
+score_prob_table <- tibble(
+  score = seq(
+    floor(min(analytic_scored$risk_score)),
+    ceiling(max(analytic_scored$risk_score)),
+    by = 5
+  )
+) %>%
+  mutate(
+    lp            = intercept + score * beta_ref,
+    predicted_prob = round(1 / (1 + exp(-lp)), 3)
+  )
+
+datatable(
+  score_prob_table,
+  caption = "Score-to-probability lookup table (every 5 points)"
+)
+```
+
+
+## 4. Bootstrap internal validation — Harrell framework
+
+### The overfitting problem
+
+When we fit a logistic model on a dataset, the parameter estimates are tuned — even
+slightly, even with many observations — to the noise in that particular sample. If we
+then evaluate the AUC by asking the model to predict the very outcomes it was optimised
+on, we get an artificially inflated estimate. That gap between apparent and true
+population performance is called **optimism**.
+
+Think of it like grading a student on the same exam they studied from: you'll
+systematically overestimate how much they actually understand.
+
+The degree of optimism depends on:
+- Sample size (smaller N → more optimism)
+- Number of predictors relative to events (fewer events per predictor → more optimism)
+- Model complexity
+
+With ~940 events and 7 predictors (~134 EPV, events-per-variable), we have a relatively
+generous dataset. But internal validation is good practice regardless — and it's
+explicitly in the TRIPOD reporting guideline for clinical prediction models.
+
+### The Harrell bootstrap procedure
+
+Harrell's method (Efron 1983, Harrell 1996) estimates optimism without splitting the data:
+
+1. Record the **apparent** metric (e.g. AUC) on the full training set.
+2. Repeat B times:
+   a. Draw a bootstrap sample of n rows **with replacement** from the training data.
+   b. Fit the full model specification on the bootstrap sample → evaluate AUC on that
+      same bootstrap sample. This step mimics "apparent" AUC in a hypothetical new dataset.
+   c. Apply the bootstrap-fit model to the **original** data → compute AUC again.
+      This step mimics "new patient" performance using the bootstrap model as a proxy.
+   d. Optimism_b = AUC_bootstrap_sample – AUC_original_data
+3. Mean optimism = average of Optimism_b across all B iterations.
+4. Corrected AUC = Apparent AUC – Mean optimism.
+
+The beauty of this approach: you never discard training data (unlike a train/test split),
+and the estimate of optimism is stable across random seeds given sufficient B.
+
+```{r bootstrap_validation}
+set.seed(42)
+val <- validate(cvd_lrm, B = 200)
+val
+```
+
+```{r auc_summary}
+# Somers' Dxy relates to AUC: Dxy = 2 × (AUC – 0.5), so AUC = Dxy/2 + 0.5
+apparent_auc  <- (val["Dxy", "index.orig"] / 2) + 0.5
+optimism      <-  val["Dxy", "optimism"]   / 2
+corrected_auc <- apparent_auc - optimism
+
+tibble(
+  metric = c("Apparent AUC (training set)",
+             "Mean optimism (B = 200 bootstrap)",
+             "Optimism-corrected AUC"),
+  value  = round(c(apparent_auc, optimism, corrected_auc), 3)
+) %>%
+  datatable(caption = "Bootstrap validation — AUC summary")
+```
+
+Interpret the corrected AUC as your best honest estimate of how the model would
+discriminate in a fresh sample of similar patients — without having to actually collect
+new data.
+
+
+## 5. Calibration slope and intercept
+
+Discrimination (AUC) tells you whether the model separates events from non-events.
+**Calibration** asks a different question: are the predicted probabilities numerically
+accurate? A model can discriminate perfectly but still tell every patient their risk is
+twice what it actually is.
+
+Two summary statistics capture this:
+
+- **Calibration intercept (calibration-in-the-large):** the mean log-odds of the
+  predicted probabilities versus the observed event rate. Should be 0. A positive value
+  means the model under-predicts on average; negative means over-prediction.
+
+- **Calibration slope:** the regression coefficient when you regress observed outcomes on
+  the model's linear predictor in a new dataset. Should be 1.0. A slope < 1 is the
+  signature of overfitting — the model spreads predicted probabilities too wide; extreme
+  predictions (very high and very low) are shrunk toward the mean in reality.
+
+Bootstrap-corrected calibration slope is one of the key summary statistics in TRIPOD
+reporting. Values above ~0.90 are generally considered acceptable for internal validation
+on a reasonably-sized dataset.
+
+```{r calibration, warning=FALSE}
+set.seed(42)
+cal <- calibrate(cvd_lrm, B = 200)
+plot(
+  cal,
+  main = "Bootstrap-corrected calibration — CVD logistic model",
+  xlab = "Predicted probability",
+  ylab = "Observed event rate"
+)
+```
+
+```{r calibration_slope}
+# The validate() output includes the calibration slope directly
+cal_slope     <- val["Slope", "index.corrected"]
+cal_intercept <- val["Intercept", "index.corrected"]
+
+tibble(
+  statistic = c("Calibration intercept (corrected)", "Calibration slope (corrected)"),
+  value     = round(c(cal_intercept, cal_slope), 3),
+  ideal     = c(0, 1)
+) %>%
+  datatable(caption = "Calibration summary statistics — bootstrap corrected")
+```
+
+
+## 6. Decision curve analysis
+
+### Beyond ROC: making decisions under uncertainty
+
+ROC curves and AUC answer "how well does the model discriminate?" but they do not answer
+the question a clinician actually faces: **"At what probability threshold should I treat,
+and does using this model to make that decision actually help patients compared to my
+alternatives?"**
+
+Decision curve analysis (Vickers & Elkin, 2006) addresses this directly by computing
+**net benefit** across a range of threshold probabilities.
+
+The threshold probability (pt) represents the clinician's implicit cost ratio: the
+probability at which they are indifferent between treating and not treating. A threshold
+of 20% means: "I'd rather treat 4 people who don't need it to prevent 1 missed event."
+
+Net benefit is defined as:
+
+    NB = (True Positives / N) – (False Positives / N) × pt / (1 – pt)
+
+The penalty term (pt / (1 – pt)) scales up the cost of false positives according to the
+threshold. At low thresholds (e.g. 10%), false positives are cheap — the treat-all
+strategy looks good. At high thresholds, they are expensive — selective treatment wins.
+
+Three curves are always plotted for comparison:
+1. **Model:** NB using the predicted probabilities to select who to treat.
+2. **Treat all:** assume every patient has the event → NB = event rate – (1 – event rate) × pt/(1–pt).
+3. **Treat none:** NB = 0 by definition.
+
+The model is clinically useful at threshold pt if its NB curve is above both treat-all
+and treat-none.
+
+```{r dca}
+# dcurves requires predicted probabilities as a column in the data frame
+analytic_dca <- analytic %>%
+  mutate(pred_prob = predict(cvd_glm, type = "response"))
+
+dca_result <- dca(
+  CVD ~ pred_prob,
+  data       = analytic_dca,
+  label      = list(pred_prob = "Logistic model"),
+  thresholds = seq(0.05, 0.50, by = 0.01)
+)
+
+plot(dca_result, smooth = TRUE) +
+  labs(
+    title    = "Decision curve analysis — CVD logistic model",
+    subtitle = "Net benefit across threshold probabilities (5% – 50%)",
+    x        = "Threshold probability",
+    y        = "Net benefit"
+  ) +
+  theme_minimal()
+```
+
+Read the DCA plot as: for any threshold probability on the x-axis, the y-axis tells you
+the net benefit per 100 patients. If the model's curve is above the "treat all" line, the
+model adds value over blanket treatment at that threshold; if above "treat none," it adds
+value over watchful waiting.
+
+
+## Summary
+
+| Component | Method | Key output |
+|---|---|---|
+| Point score | Sullivan scaling (β / β_ref) | Integer score + lookup table |
+| Internal validation | Harrell bootstrap (B=200) | Optimism-corrected AUC |
+| Calibration | Bootstrap-corrected slope/intercept | Slope ≈ 1, intercept ≈ 0 |
+| Clinical utility | Decision curve analysis | Net benefit vs treat-all/none |
+
+**TRIPOD checklist items covered here:** model performance (discrimination + calibration),
+internal validation method, presentation of absolute predicted probabilities.
