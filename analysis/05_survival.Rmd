@@ -1,0 +1,218 @@
+---
+title: "05_survival"
+output: html_document
+date: "2026-05-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE}
+# New package: renv::install("survminer"); renv::snapshot()
+library(tidyverse)
+library(here)
+library(DT)
+library(survival)    # core: Surv(), survfit(), survdiff(), coxph(), cox.zph()
+library(survminer)   # ggplot2 KM plots: ggsurvplot()
+library(broom)       # tidy() for clean Cox output
+```
+
+
+## 1. Analytic sample
+
+```{r}
+# read in and clean df
+
+framingham <- read_csv(here("data", "raw", "framingham.csv"))
+
+analytic <- framingham %>% 
+  filter(PERIOD == 1, PREVCHD == 0) %>% 
+  select(
+    RANDID, CVD, AGE, SYSBP, TOTCHOL, BMI, GLUCOSE, CURSMOKE, DIABETES, SEX, TIMECVD) %>% 
+  drop_na() %>% 
+  mutate(timecvd_yr = TIMECVD / 365.25) %>% 
+  select(-TIMECVD)
+
+# verify df
+
+analytic %>%
+  summarise(
+    n          = n(),
+    n_cvd      = sum(CVD),
+    cvd_rate   = round(mean(CVD), 3)
+  )
+```
+
+
+
+## 2. The survival object
+
+# Before any modelling or plotting, we package the outcome into a Surv object.
+# Surv(time, event) pairs each patient's follow-up time with their event status.
+# Censored observations (CVD == 0) contribute their survival time as a lower bound.
+
+```{r surv_object}
+surv_obj <- Surv(time  = analytic$timecvd_yr,
+                 event = analytic$CVD)
+
+# Quick look: the + symbol marks censored observations
+head(surv_obj, 20)
+```
+
+
+## 3. Kaplan-Meier — overall survival curve
+
+```{r km_overall}
+# survfit() estimates the survival function from a Surv object.
+# The formula ~ 1 means "one curve for the whole sample, no grouping."
+km_overall <- survfit(surv_obj ~ 1, data = analytic)
+
+summary(km_overall, times = c(2, 5, 8, 10, 12))
+```
+
+```{r km_overall_plot}
+ggsurvplot(
+  km_overall,
+  data       = analytic,
+  conf.int   = TRUE,
+  risk.table = TRUE,        # patients still at risk shown below the curve
+  xlab       = "Time (years)",
+  ylab       = "CVD-free probability",
+  title      = "Kaplan-Meier — overall CVD-free survival",
+  ggtheme    = theme_minimal()
+)
+```
+
+
+## 4. KM stratified by key predictors
+
+```{r km_smoking}
+km_smoke <- survfit(surv_obj ~ CURSMOKE, data = analytic)
+
+ggsurvplot(
+  km_smoke,
+  data       = analytic,
+  conf.int   = TRUE,
+  risk.table = TRUE,
+  legend.labs = c("Non-smoker", "Smoker"),
+  xlab       = "Time (years)",
+  ylab       = "CVD-free probability",
+  title      = "KM by smoking status",
+  ggtheme    = theme_minimal()
+)
+```
+
+```{r km_diabetes}
+km_diab <- survfit(surv_obj ~ DIABETES, data = analytic)
+
+ggsurvplot(
+  km_diab,
+  data        = analytic,
+  conf.int    = TRUE,
+  risk.table  = TRUE,
+  legend.labs = c("No diabetes", "Diabetes"),
+  xlab        = "Time (years)",
+  ylab        = "CVD-free probability",
+  title       = "KM by diabetes status",
+  ggtheme     = theme_minimal()
+)
+```
+
+```{r km_sex}
+km_sex <- survfit(surv_obj ~ SEX, data = analytic)
+
+ggsurvplot(
+  km_sex,
+  data        = analytic,
+  conf.int    = TRUE,
+  risk.table  = TRUE,
+  legend.labs = c("Male", "Female"),
+  xlab        = "Time (years)",
+  ylab        = "CVD-free probability",
+  title       = "KM by sex",
+  ggtheme     = theme_minimal()
+)
+```
+
+
+## 5. Log-rank test
+
+# The log-rank test asks: are these survival curves significantly different,
+# or could the gap be explained by chance? One test per stratifier.
+
+```{r logrank}
+logrank_smoke <- survdiff(surv_obj ~ CURSMOKE, data = analytic)
+logrank_diab  <- survdiff(surv_obj ~ DIABETES,  data = analytic)
+logrank_sex   <- survdiff(surv_obj ~ SEX,        data = analytic)
+
+logrank_smoke
+logrank_diab
+logrank_sex
+```
+
+
+## 6. Cox proportional hazards model
+
+# Same seven predictors as the Phase 3 logistic model — allows direct comparison
+# of hazard ratios (HR) to the odds ratios (OR) we already computed.
+
+```{r cox_fit}
+cox_fit <- coxph(
+  surv_obj ~ AGE + SYSBP + TOTCHOL + BMI + GLUCOSE + CURSMOKE + DIABETES,
+  data = analytic
+)
+
+summary(cox_fit)
+```
+
+```{r cox_tidy}
+tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  datatable(caption = "Cox model — hazard ratios with 95% CI")
+```
+
+
+## 7. Proportional hazards assumption check
+
+# The Cox model assumes that the hazard ratio for each predictor is constant
+# over time — the "proportional hazards" assumption.
+# cox.zph() tests this using scaled Schoenfeld residuals.
+# A significant p-value (< 0.05) flags a predictor whose effect varies over time.
+
+```{r ph_test}
+ph_test <- cox.zph(cox_fit)
+ph_test
+```
+
+```{r ph_plot}
+# Plot scaled Schoenfeld residuals for each predictor.
+# A flat, horizontal line supports the PH assumption.
+# A sloped or curved line suggests the hazard ratio changes over time.
+ggcoxzph(ph_test)
+```
+
+
+## 8. HR vs OR comparison — what does survival analysis add?
+
+```{r hr_or_compare}
+# Side-by-side: hazard ratios from Cox vs odds ratios from Phase 3 logistic
+cox_hr <- tidy(cox_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  rename(HR = estimate, HR_lo = conf.low, HR_hi = conf.high)
+
+# Re-fit Phase 3 logistic model for direct comparison
+glm_fit <- glm(
+  CVD ~ AGE + SYSBP + TOTCHOL + BMI + GLUCOSE + CURSMOKE + DIABETES,
+  family = binomial, data = analytic
+)
+
+glm_or <- tidy(glm_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  select(term, estimate, conf.low, conf.high) %>%
+  rename(OR = estimate, OR_lo = conf.low, OR_hi = conf.high)
+
+left_join(cox_hr, glm_or, by = "term") %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  datatable(caption = "HR (Cox) vs OR (logistic) — same predictors, same sample")
+```
